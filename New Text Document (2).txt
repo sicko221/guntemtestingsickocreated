@@ -1,0 +1,1437 @@
+local GunHandler = {}
+
+local Services = {
+	PlayerService = game:GetService("Players"),
+	RunService = game:GetService("RunService"),
+	UserInputService = game:GetService("UserInputService"),
+	ReplicatedStorage = game:GetService("ReplicatedStorage"),
+	Debris = game:GetService("Debris"),
+	TweenService = game:GetService("TweenService"),
+	SoundService = game:GetService("SoundService"),
+	GuiService = game:GetService("GuiService"),
+	Lighting = game:GetService("Lighting"),
+	StarterGui = game:GetService("StarterGui"),
+	GameSettings = game:GetService("UserGameSettings"), 	
+	Teams = game:GetService("Teams"),
+}
+
+local PlayerCamera = require(Services.ReplicatedStorage.Modules.Utilities.PlayerCamera)
+PlayerCamera:Initialize()
+local AnimationHandler = require(Services.ReplicatedStorage.Modules.AnimationHandler)
+local SpringPhysics = require(Services.ReplicatedStorage.Modules.Utilities.SpringPhysics).new
+local MousePosition = require(Services.ReplicatedStorage.Modules.Utilities.MousePosition)
+local FoundHumanoid = require(Services.ReplicatedStorage.Modules.Utilities.FindHumanoid)
+
+local LocalPlayer = Services.PlayerService.LocalPlayer
+local Network = require(Services.ReplicatedStorage.Modules.Network)
+local GunAssets = Services.ReplicatedStorage:WaitForChild("GunAssets")
+local GunGui = LocalPlayer.PlayerGui:FindFirstChild("GunGui")
+local MouseDefault = LocalPlayer:GetMouse()
+
+
+local Ignore = {}
+local KilledPlayer = {
+	LastPlayer = nil,
+}
+
+local AimOffset = {
+	X = 2.045,
+	Y = 0.082,
+}
+
+local Barriers = {
+	MenuOpened = false,
+	ConsoleOpen = false,
+}
+
+local Character = {
+	Rig = nil,
+	RootPart = nil,
+	Humanoid = nil,
+	Loaded = nil,
+}
+
+local EquipedTool = {
+	Equipped = nil,
+	Model = nil,
+	Module = nil,
+	Reloading = nil,
+	Firing = nil,
+	CanFire = nil,
+	HotFire = nil,
+	MuzzleSmoke = nil,
+	Animations = {},
+}
+
+local ShoulderSide = "Right"
+
+function RandomVector(Minimum, Maximum)
+	return Minimum + Vector3.new(math.random(), math.random(), math.random()) * (Maximum - Minimum) 
+end
+
+function UserInput(Type, Input, Typing)
+	if not EquipedTool.Equipped and not Character.Rig then
+		return
+	end
+	if Type == "Started" then
+		if Typing then
+			return
+		end
+		if Input.KeyCode == Enum.KeyCode.Q then
+			if ShoulderSide == "Right" then
+				ShoulderSide = "Left"
+				if script:GetAttribute("Aiming") then
+					PlayerCamera:SetOffset(Vector3.new(PlayerCamera:GetOffset().X-(AimOffset.X*2),PlayerCamera:GetOffset().Y,PlayerCamera:GetOffset().Z))
+				end
+			elseif ShoulderSide == "Left" then
+				ShoulderSide = "Right"
+				if script:GetAttribute("Aiming") then
+					PlayerCamera:SetOffset(Vector3.new(PlayerCamera:GetOffset().X+(AimOffset.X*2),PlayerCamera:GetOffset().Y,PlayerCamera:GetOffset().Z))
+				end
+			end
+		elseif Input.KeyCode == Enum.KeyCode.F9 then
+			if Barriers.ConsoleOpen then
+				Barriers.ConsoleOpen = false
+			else
+				Barriers.ConsoleOpen = true
+				if EquipedTool.Firing then
+					EquipedTool.Firing = false
+				end
+			end
+		elseif Input.KeyCode == Enum.KeyCode.X then
+			if EquipedTool.Equipped and EquipedTool.Module.Bullet.ToggleFiringMode and not EquipedTool.Firing and not EquipedTool.Reloading then
+				if EquipedTool.Model:GetAttribute("ToggleMode") == false then
+					EquipedTool.Model:SetAttribute("ToggleMode",true) 
+					EquipedTool.Module.Bullet.FiringMode = "Semi"
+					EquipedTool.Model.Handle.Mode:Play()
+					Network:send("ReplicateSound","Handle","Mode")
+				else
+					EquipedTool.Model:SetAttribute("ToggleMode",false)
+					EquipedTool.Module.Bullet.FiringMode = "Auto"
+					EquipedTool.Model.Handle.Mode:Play()
+					Network:send("ReplicateSound","Handle","Mode")
+				end
+			end
+		elseif Input.KeyCode == Enum.KeyCode.V then
+			if EquipedTool.Equipped and not EquipedTool.Firing and not EquipedTool.Reloading then
+				EquipedTool.Model.Handle.Mode:Play()
+				Network:send("ReplicateSound","Handle","Mode")
+				if EquipedTool.Model:GetAttribute("Safety") == false then
+					EquipedTool.Model:SetAttribute("Safety",true)
+				else
+					EquipedTool.Model:SetAttribute("Safety",false)
+				end
+			end
+		elseif Input.KeyCode == Enum.KeyCode.R then
+			if EquipedTool.Equipped and (not EquipedTool.Reloading and EquipedTool.Model:GetAttribute("AmmoInMag") ~= EquipedTool.Module.Bullet.Capacity) then
+				GunHandler.Reload()
+			end
+		elseif Input.UserInputType == Enum.UserInputType.MouseButton2 then
+			if not EquipedTool.Reloading and not script:GetAttribute("Aiming") and not Barriers.MenuOpened then
+				GunHandler.Aim(true)
+			end
+		elseif Input.UserInputType == Enum.UserInputType.MouseButton1 then
+			if EquipedTool.Equipped and not EquipedTool.Reloading and script:GetAttribute("Aiming") and EquipedTool.Model:GetAttribute("Safety") == false then
+				GunHandler.PreFire()
+			end
+		end
+	elseif Type == "Ended" then
+		if Input.UserInputType == Enum.UserInputType.MouseButton2 then
+			if not EquipedTool.Reloading and script:GetAttribute("Aiming") then
+				GunHandler.Aim(false)
+				if EquipedTool.Module.Effects.LoopedFireAudio then
+					AnimationHandler:Stop(EquipedTool.Animations,"SpinAnimation")
+					EquipedTool.Model.Handle.AttachmentEmitter.Fire:Stop()
+					EquipedTool.Model.Handle.AttachmentEmitter.WindLoop:Stop()
+					Network:send("ReplicateSound","AttachmentEmitter","Stop")
+				end
+			end
+		elseif Input.UserInputType == Enum.UserInputType.MouseButton1 then
+			if EquipedTool.Firing then
+				EquipedTool.Firing = false
+				if EquipedTool.Module.Effects.LoopedFireAudio then
+					AnimationHandler:Stop(EquipedTool.Animations,"SpinAnimation")
+					EquipedTool.Model.Handle.AttachmentEmitter.Fire:Stop()
+					EquipedTool.Model.Handle.AttachmentEmitter.WindLoop:Stop()
+					Network:send("ReplicateSound","AttachmentEmitter","Stop")
+				end
+			end
+		end
+	elseif Type == "Changed" then
+		return
+	end
+end
+
+
+function GunHandler.Reload()
+	EquipedTool.Firing,EquipedTool.CanFire,EquipedTool.Reloading = false,false,true
+	if script:GetAttribute("Aiming") then
+		GunHandler.Aim(false)
+	end
+	local ReloadAnimation = nil
+	if EquipedTool.Model:GetAttribute("AmmoInMag") == 0 then
+		ReloadAnimation = "HotReloadAnimation"
+	else
+		ReloadAnimation = "TacticalReloadAnimation"
+	end
+	AnimationHandler:Play(EquipedTool.Animations, ReloadAnimation,0.100000001,1,1.5)
+	
+	--local Function = nil
+	--Function = EquipedTool.Animations[ReloadAnimation].Stopped:Connect(function()
+		--Function:Disconnect()
+		if Character.Rig and Character.Rig:FindFirstChildOfClass("Tool") then
+			EquipedTool.Model:SetAttribute("AmmoInMag",EquipedTool.Module.Bullet.Capacity)
+			EquipedTool.CanFire,EquipedTool.Reloading = true,false
+			if Services.UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) and Character.Humanoid and Character.Humanoid.Health ~= 0 then
+				GunHandler.Aim(true)
+			else
+				AnimationHandler:Play(EquipedTool.Animations, "IdleAnimation",1)
+			end
+		else
+			EquipedTool.CanFire,EquipedTool.Reloading = true,false
+		end
+	--end)
+end
+
+
+function GunHandler.PreFire()
+	if EquipedTool.Model:GetAttribute("AmmoInMag") <= 0 then
+		Network:send("ReplicateSound","Handle","Prime")
+		local Empty = EquipedTool.Model.Handle.Prime:Clone()
+		Empty.Parent = EquipedTool.Model.Handle
+		Empty:Play()
+		Services.Debris:AddItem(Empty,Empty.TimeLength)
+		return
+	end
+	local FiringMode = EquipedTool.Module.Bullet.FiringMode
+	if FiringMode == "Semi" then
+		if EquipedTool.CanFire then
+			EquipedTool.CanFire = false
+			local Attachment = EquipedTool.Model.Handle.AttachmentEmitter
+			local Finished = false
+			local Params = RaycastParams.new()
+			Ignore = {Character.Rig,workspace.Ignore}
+			Params.FilterDescendantsInstances = Ignore
+
+			while not Finished do
+				local Raycast = workspace:Raycast(Character.Rig.UpperTorso.Position, (Attachment.WorldPosition - Character.Rig.UpperTorso.Position).Unit * (Character.Rig.UpperTorso.Position - Attachment.WorldPosition).Magnitude, Params)
+				if not Raycast or (Raycast.Instance.CanCollide or (Raycast.Instance.Parent:FindFirstChild("Humanoid"))) then
+					Finished = true
+					if not Raycast or FoundHumanoid.ReturnHumanoid(Raycast.Instance) then
+						GunHandler.Shoot()
+						local NewAmmo = EquipedTool.Model:GetAttribute("AmmoInMag") - 1
+						EquipedTool.Model:SetAttribute("AmmoInMag",NewAmmo)
+					end
+				else
+					table.insert(Ignore,Raycast.Instance)
+					Params.FilterDescendantsInstances = Ignore
+				end
+			end
+			task.wait(60/EquipedTool.Module.Bullet.RPM)
+			EquipedTool.CanFire = true
+		end
+	elseif FiringMode == "Auto" then
+		if EquipedTool.CanFire then
+			EquipedTool.Firing = true
+			spawn(function()
+				while EquipedTool.Firing and EquipedTool.CanFire and EquipedTool.Equipped do
+					if EquipedTool.Model:GetAttribute("AmmoInMag") <= 0 then
+						if EquipedTool.Module.Effects.LoopedFireAudio then
+							AnimationHandler:Stop(EquipedTool.Animations,"SpinAnimation")
+							EquipedTool.Model.Handle.AttachmentEmitter.Fire:Stop()
+							EquipedTool.Model.Handle.AttachmentEmitter.WindLoop:Stop()
+							Network:send("ReplicateSound","AttachmentEmitter","Stop")
+						end
+						EquipedTool.Firing = false
+						EquipedTool.CanFire = true
+						local Empty = EquipedTool.Model.Handle.Empty:Clone()
+						Empty.Parent = EquipedTool.Model.Handle
+						Empty:Play()
+						Services.Debris:AddItem(Empty,Empty.TimeLength)
+						Network:send("ReplicateSound","Handle","Empty")
+						break
+					end
+					local Attachment = EquipedTool.Model.Handle.AttachmentEmitter
+					local Finished = false
+					local Params = RaycastParams.new()
+					Ignore = {Character.Rig,workspace.Ignore}
+					Params.FilterDescendantsInstances = Ignore
+
+					while not Finished do
+						local Raycast = workspace:Raycast(Character.Rig.UpperTorso.Position, (Attachment.WorldPosition - Character.Rig.UpperTorso.Position).Unit * (Character.Rig.UpperTorso.Position - Attachment.WorldPosition).Magnitude, Params)
+						if not Raycast or (Raycast.Instance.CanCollide or (Raycast.Instance.Parent:FindFirstChild("Humanoid") and Raycast.Instance.Name ~= "HumanoidRootPart")) then
+							Finished = true
+							if not Raycast or FoundHumanoid.ReturnHumanoid(Raycast.Instance) then
+								GunHandler.Shoot()
+								local NewAmmo = EquipedTool.Model:GetAttribute("AmmoInMag") - 1
+								EquipedTool.Model:SetAttribute("AmmoInMag",NewAmmo)
+							else
+								if EquipedTool.Module.Effects.LoopedFireAudio then
+									if EquipedTool.Model.Handle.AttachmentEmitter.Fire.IsPlaying then
+										AnimationHandler:Stop(EquipedTool.Animations,"SpinAnimation")
+										EquipedTool.Model.Handle.AttachmentEmitter.Fire:Stop()
+										EquipedTool.Model.Handle.AttachmentEmitter.WindLoop:Stop()
+										Network:send("ReplicateSound","AttachmentEmitter","Stop")
+									end
+								end
+							end
+						else
+							table.insert(Ignore,Raycast.Instance)
+							Params.FilterDescendantsInstances = Ignore
+						end
+					end
+					EquipedTool.CanFire = false
+					task.wait(60/EquipedTool.Module.Bullet.RPM)
+					EquipedTool.CanFire = true
+				end
+			end)
+		end
+	end
+end
+
+function GunHandler.Shoot()
+	if EquipedTool.Model:GetAttribute("AmmoInMag") == 0 then
+		if EquipedTool.Module.Effects.LoopedFireAudio then
+			AnimationHandler:Stop(EquipedTool.Animations,"SpinAnimation")
+			EquipedTool.Model.Handle.AttachmentEmitter.Fire:Stop()
+			EquipedTool.Model.Handle.AttachmentEmitter.WindLoop:Stop()
+			Network:send("ReplicateSound","AttachmentEmitter","Stop")
+		end
+		local Empty = EquipedTool.Model.Handle.Empty:Clone()
+		Empty.Parent = EquipedTool.Model.Handle
+		Empty:Play()
+		Services.Debris:AddItem(Empty,Empty.TimeLength)
+		Network:send("ReplicateSound","Handle","Empty")
+		return
+	end
+	EquipedTool.Model:SetAttribute("MuzzleSmoke",(EquipedTool.Model:GetAttribute("MuzzleSmoke") + EquipedTool.Module.Effects.MuzzleAdd))
+	AnimationHandler:Stop(EquipedTool.Animations, "RecoilAnimation",-1)
+	AnimationHandler:Play(EquipedTool.Animations, "RecoilAnimation",-1)
+	local Attachment = EquipedTool.Model.Handle.AttachmentEmitter
+	if EquipedTool.Module.Effects.LoopedFireAudio then
+		AnimationHandler:Play(EquipedTool.Animations,"SpinAnimation")
+		if not EquipedTool.Model.Handle.AttachmentEmitter.Fire.IsPlaying then
+			Attachment.Fire:Play()
+			Attachment.WindLoop:Play()
+			Network:send("ReplicateSound","AttachmentEmitter","Play")
+		end
+	else
+		local Sound = EquipedTool.Model.Handle.AttachmentEmitter.Fire:Clone()
+		Sound.Parent = Attachment
+		Sound:Play()
+		Services.Debris:AddItem(Sound,4)
+	end
+	Attachment.Flash:Emit(8)
+	Attachment.SmokeSides:Emit(8)
+	Network:send("ReplicateEffect","AttachmentEmitter",EquipedTool.Module.Effects.LoopedFireAudio)
+	PlayerCamera:Shake(RandomVector(EquipedTool.Module.Recoil.Min, EquipedTool.Module.Recoil.Max))
+	for I = 1, EquipedTool.Module.Bullet.NumberOfShots do
+		local ReturnInstance,ReturnedPosition,Normal,Finished = nil,nil,nil,false
+		local Params = RaycastParams.new()
+		local MousePosistion, MouseHit, MouseNormal = MousePosition.Get(Character.Rig,"Shoot")
+		local mdist = (MousePosistion - Attachment.WorldPosition).Magnitude
+		if EquipedTool.Module.Bullet.Spread  then
+			MousePosistion += Vector3.new(math.random(-100,100)*mdist/2000,math.random(-100,100)*mdist/2000,math.random(-100,100)*mdist/2000)
+		end
+		Ignore = {Character.Rig,workspace.Ignore}
+		Params.FilterDescendantsInstances = Ignore
+		local Amr = nil
+		while not Finished do
+			local Raycast = workspace:Raycast(Attachment.WorldPosition, (MousePosistion - Attachment.WorldPosition) * 5000, Params)
+			if not Raycast or ((Raycast.Instance.CanCollide and Raycast.Instance.Name ~= "Armour") or (Raycast.Instance.Parent:FindFirstChild("Humanoid")) and Raycast.Instance.Name ~= "HumanoidRootPart") then
+				Finished = true
+				if Raycast then
+					ReturnInstance,ReturnedPosition,Normal = Raycast.Instance,Raycast.Position,Raycast.Normal
+					CreateEffect("Particle",Raycast.Instance,Raycast.Position,Raycast.Normal)
+					Network:send("ReplicateTracer",ReturnInstance,ReturnedPosition,Normal,nil)
+				else
+					ReturnedPosition = Attachment.WorldPosition + (MousePosistion - Attachment.WorldPosition) * 5000
+				end
+			else
+				if Raycast.Instance.Name == "Armour" then
+					local Level,Health = Raycast.Instance:GetAttribute("Level"),Raycast.Instance:GetAttribute("Health")
+					if EquipedTool.Module.Bullet.ArmourPenValue >= Level and Health > 0 then
+						Amr = Health
+						CreateHitmarker("ArmourThrough")
+					elseif EquipedTool.Module.Bullet.ArmourPenValue <= Level and Health > 0 then
+						Finished = true
+						ReturnInstance,ReturnedPosition,Normal = Raycast.Instance,Raycast.Position,Raycast.Normal
+						CreateHitmarker("ArmourStop")
+					end
+					CreateEffect("Particle",Raycast.Instance,Raycast.Position,Raycast.Normal)
+					Network:send("ReplicateTracer",Raycast.Instance,Raycast.Position,Raycast.Normal,nil)
+					Network:send("Armour",Raycast.Instance,EquipedTool.Module.Damages.Torso,EquipedTool.Module.Bullet.ArmourPenValue)
+				end
+				if Raycast.Instance.Transparency ~= 1 and Raycast.Instance.Name ~= "Armour" then
+					CreateEffect("Particle",Raycast.Instance,Raycast.Position,Raycast.Normal)
+					Network:send("ReplicateTracer",Raycast.Instance,Raycast.Position,Raycast.Normal,nil)
+				end
+				table.insert(Ignore,Raycast.Instance)
+				Params.FilterDescendantsInstances = Ignore
+			end
+		end	
+
+
+		coroutine.resume(coroutine.create(function()
+			local NewTracer = GunAssets.Tracers.Tracer1:Clone()
+			NewTracer.Parent = workspace.Ignore
+			NewTracer.Position = Attachment.WorldPosition
+			NewTracer.BodyVelocity.Velocity = (ReturnedPosition - Attachment.WorldPosition).Unit * 2000
+			NewTracer.Trail.Transparency = NumberSequence.new{
+				NumberSequenceKeypoint.new(0, 1), 
+				NumberSequenceKeypoint.new(1, 1),
+			}
+			Network:send("ReplicateTracer",ReturnInstance,ReturnedPosition,Normal,Attachment)
+			if ReturnInstance and Normal then
+				if (ReturnedPosition - Attachment.WorldPosition).Magnitude/2000 >= 0.045 and NewTracer then
+					task.delay(0.045,function()
+						NewTracer.Trail.Transparency = NumberSequence.new{
+							NumberSequenceKeypoint.new(0, 0), 
+							NumberSequenceKeypoint.new(1, 0),
+						}
+					end)
+				end
+				Services.Debris:AddItem(NewTracer,math.max(0.045,(ReturnedPosition - Attachment.WorldPosition).Magnitude/2000))
+			elseif not ReturnInstance then
+				if NewTracer then
+					task.delay(0.045,function()
+						NewTracer.Trail.Transparency = NumberSequence.new{
+							NumberSequenceKeypoint.new(0, 0), 
+							NumberSequenceKeypoint.new(1, 0),
+						}
+					end)
+				end
+				Services.Debris:AddItem(NewTracer,2)
+			end
+			if FoundHumanoid.ReturnHumanoid(ReturnInstance) then
+				local Damage = nil
+				if ReturnInstance.Name == "Head" then
+					Damage = EquipedTool.Module.Damages.Head
+				elseif ReturnInstance.Name == "UpperTorso" or ReturnInstance.Name == "LowerTorso" then
+					Damage = EquipedTool.Module.Damages.Torso
+				else
+					Damage = EquipedTool.Module.Damages.Base
+				end
+				if Amr ~= nil then
+					Damage -= math.sqrt(Amr)
+				else
+					CreateHitmarker("Person",ReturnInstance.Name)
+				end
+				Network:send("DamageReplication",FoundHumanoid.ReturnHumanoid(ReturnInstance),Damage,Attachment,MousePosistion,Ignore,ReturnInstance)
+			end
+		end))
+	end
+end
+
+
+function GunHandler.Aim(Bool1,Bool2)
+	if (not Character.Rig) or (not EquipedTool.Equipped or EquipedTool.Reloadin) then
+		return
+	end
+	if Bool1 then	
+		print("is doin")
+		script:SetAttribute("Aiming",true)
+		Character.Humanoid.AutoRotate = false
+		--PlayerMovement.Sprint(false)
+		AnimationHandler:Stop(EquipedTool.Animations, "IdleAnimation",0.2)
+		AnimationHandler:Play(EquipedTool.Animations, "AimAniamtion",0.2)
+		PlayerCamera:SetFOV(50,12,.9);PlayerCamera:MaxAndMin(2,8,7)
+		local AimIn = GunAssets.Sounds.Raise:Clone()
+		AimIn.Parent = Services.SoundService
+		AimIn.PlayOnRemove = true
+		Services.Debris:AddItem(AimIn,0)
+		if ShoulderSide == "Right" then
+			PlayerCamera:SetOffset(Vector3.new(PlayerCamera:GetOffset().X+AimOffset.X, PlayerCamera:GetOffset().Y+AimOffset.Y, PlayerCamera:GetOffset().Z))
+		elseif ShoulderSide == "Left" then
+			PlayerCamera:SetOffset(Vector3.new(PlayerCamera:GetOffset().X-AimOffset.X, PlayerCamera:GetOffset().Y+AimOffset.Y, PlayerCamera:GetOffset().Z))
+		end
+		Services.TweenService:Create(GunGui.Crosshair, TweenInfo.new(0.5, Enum.EasingStyle.Quad), {ImageTransparency = 0}):Play()
+		Services.TweenService:Create(GunGui.Crosshair, TweenInfo.new(0.3, Enum.EasingStyle.Quad), {Size = UDim2.new(0, 10, 0, 10)}):Play()
+		GunGui.Crosshair.Position = UDim2.new(0,MouseDefault.X,0,MouseDefault.Y)
+		GunGui.Hitmarker.Position = UDim2.new(0,MouseDefault.X,0,MouseDefault.Y)
+	else
+		if PlayerCamera:GetOffset().X == 0 or not script:GetAttribute("Aiming") then
+			return
+		end
+		script:SetAttribute("Aiming",false)
+		EquipedTool.Firing = false
+		Character.Humanoid.AutoRotate = true
+		--if Services.UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) and Character.Humanoid then
+		--	PlayerMovement.Sprint(true)
+		--end
+		AnimationHandler:Play(EquipedTool.Animations, "IdleAnimation",0.2)
+		AnimationHandler:Stop(EquipedTool.Animations, "AimAniamtion",0.2)
+		PlayerCamera:SetFOV(70,14,1);PlayerCamera:MaxAndMin(4,12,7)
+		local AimOut = GunAssets.Sounds.Lower:Clone()
+		AimOut.Parent = Services.SoundService
+		AimOut.PlayOnRemove = true
+		Services.Debris:AddItem(AimOut,0)
+		if ShoulderSide == "Right" then
+			PlayerCamera:SetOffset(Vector3.new(PlayerCamera:GetOffset().X-AimOffset.X, PlayerCamera:GetOffset().Y-AimOffset.Y, PlayerCamera:GetOffset().Z))
+		elseif ShoulderSide == "Left" then
+			PlayerCamera:SetOffset(Vector3.new(PlayerCamera:GetOffset().X+AimOffset.X, PlayerCamera:GetOffset().Y-AimOffset.Y, PlayerCamera:GetOffset().Z))
+		end
+		Services.TweenService:Create(GunGui.Crosshair, TweenInfo.new(0.5, Enum.EasingStyle.Quad), {ImageTransparency = 1}):Play()
+		Services.TweenService:Create(GunGui.Crosshair, TweenInfo.new(0.3, Enum.EasingStyle.Quad), {Size = UDim2.new(0, 0, 0, 0	)}):Play()
+	end
+end
+
+
+function Character.NewCharacter(NewCharacterRig)
+	Character.Rig,Character.RootPart,Character.Humanoid = NewCharacterRig,NewCharacterRig:WaitForChild("HumanoidRootPart", 1),NewCharacterRig:WaitForChild("Humanoid", 1)
+	Character.Rig:WaitForChild("Head")
+	Ignore = {}
+	table.insert(Ignore, Character.Rig)
+	table.insert(Ignore, workspace.Ignore)
+	task.wait()
+	Character.Loaded = true
+	GunGui = LocalPlayer.PlayerGui:WaitForChild("GunGui",1)
+	Network:send("CloneHandle")
+	delay(1,function()
+		if Character.Rig then 
+			Services.StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Backpack,true)
+		end
+	end)
+	Character.Humanoid.Died:Connect(Character.Removed)
+	Character.Rig.ChildAdded:Connect(Character.ChildAdd)
+	Character.Rig.ChildRemoved:Connect(Character.ChildRemove)
+end
+
+function Character.Removed()
+	GunHandler.Aim(false)
+	PlayerCamera:Aim(false)
+	if EquipedTool.Equipped then
+		if EquipedTool.Module.Effects.LoopedFireAudio then
+			AnimationHandler:Stop(EquipedTool.Animations,"SpinAnimation")
+			EquipedTool.Model.Handle.AttachmentEmitter.Fire:Stop()
+			EquipedTool.Model.Handle.AttachmentEmitter.WindLoop:Stop()
+			Network:send("ReplicateSound","AttachmentEmitter","Stop")
+		end
+	end
+	AnimationHandler:StopAnimationsInTable(EquipedTool.Animations)
+	Services.StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Backpack,false)
+	if KilledPlayer.LastPlayer ~= nil then
+		Network:send("Death",KilledPlayer.LastPlayer)
+		LocalPlayer:SetAttribute("KilledBy", KilledPlayer.LastPlayer.Name)
+		KilledPlayer.LastPlayer = nil
+	end
+	EquipedTool.Model,EquipedTool.Module,EquipedTool.CanFire,EquipedTool.Reloading,EquipedTool.Equipped,Character.Rig,Character.RootPart,Character.Humanoid,Character.Loaded = nil;EquipedTool.Animations = {}
+end
+
+function Character.ChildAdd(Child)
+	if not Character.Rig then
+		return
+	end
+	if Child:IsA("Tool") and Child:GetAttribute("FrameworkTool") then
+		EquipedTool.Model,EquipedTool.Module,EquipedTool.CanFire,EquipedTool.Reloading,EquipedTool.Equipped = Child,require(Child:FindFirstChildWhichIsA("ModuleScript")),true,false,true
+		PlayerCamera.MouseLocked = true
+		PlayerCamera:Aim(true)
+		if not Child:GetAttribute("AmmoInMag") then
+			Child:SetAttribute("AmmoInMag",EquipedTool.Module.Bullet.Capacity)
+			Child:SetAttribute("Safety",false)
+			if EquipedTool.Module.Bullet.ToggleFiringMode then
+				Child:SetAttribute("ToggleMode",false)
+			end
+		end
+		local Motor = Character.Rig.RightHand:FindFirstChild("Handle")
+		if Motor == nil then
+			Network:send("CloneHandle")
+		end
+		Motor.Part0 = Character.Rig.RightHand
+		Motor.Part1 = EquipedTool.Model.Handle
+		Network:send("ParentHandle",Character.Rig.RightHand.Handle,EquipedTool.Model.Handle,Character.Rig.RightHand)
+		EquipedTool.Animations = AnimationHandler:Create(EquipedTool.Module.Animations,Character.Humanoid:WaitForChild("Animator"))
+		for _,Animation in next, EquipedTool.Animations do
+			AnimationHandler:Play(EquipedTool.Animations, "IdleAnimation",.3)
+			if EquipedTool.Model:GetAttribute("AmmoInMag") == 0 and EquipedTool.Module.Bullet.SlideComesBack then
+				AnimationHandler:Play(EquipedTool.Animations,"GunBackAnimation")
+			end
+			Animation:GetMarkerReachedSignal("MagOut"):Connect(function()
+				EquipedTool.Model.Handle.MagOut:Play()
+				Network:send("ReplicateSound","Handle","MagOut")
+			end)
+			Animation:GetMarkerReachedSignal("MagIn"):Connect(function()
+				EquipedTool.Model.Handle.MagIn:Play()
+				--Events.MainEvent:FireServer("ReplicateSound","Handle","MagIn")
+			end)
+			Animation:GetMarkerReachedSignal("BoltOut"):Connect(function()
+				EquipedTool.Model.Handle.BoltOut:Play()
+				--Events.MainEvent:FireServer("ReplicateSound","Handle","BoltOut")
+			end)
+			Animation:GetMarkerReachedSignal("BoltIn"):Connect(function()
+				EquipedTool.Model.Handle.BoltIn:Play()
+				--Events.MainEvent:FireServer("ReplicateSound","Handle","BoltIn")
+				if EquipedTool.Module.Bullet.SlideComesBack then
+					AnimationHandler:Stop(EquipedTool.Animations,"GunBackAnimation")
+				end
+			end)
+			Animation:GetMarkerReachedSignal("TopBack"):Connect(function()
+				EquipedTool.Model.Handle.TopBack:Play()
+				--Events.MainEvent:FireServer("ReplicateSound","Handle","TopBack")
+			end)
+			Animation:GetMarkerReachedSignal("TopForward"):Connect(function()
+				EquipedTool.Model.Handle.TopForward:Play()
+				--Events.MainEvent:FireServer("ReplicateSound","Handle","TopForward")
+			end)
+			Animation:GetMarkerReachedSignal("EjectGas"):Connect(function()
+				if EquipedTool.Model:GetAttribute("AmmoInMag") == 0 and EquipedTool.Module.Bullet.FiringMode == "Semi" and EquipedTool.Module.Bullet.SlideComesBack then
+					AnimationHandler:Play(EquipedTool.Animations,"GunBackAnimation")
+					EquipedTool.Model.Handle.BoltOut:Play()
+					--Events.MainEvent:FireServer("ReplicateSound","Handle","BoltOut")
+				end
+			end)
+		end
+	end
+end
+
+function Character.ChildRemove(Child)
+	if Child:IsA("Tool") then
+		if script:GetAttribute("Aiming") then
+			GunHandler.Aim(false)
+		end
+		PlayerCamera.MouseLocked = true
+		PlayerCamera:Aim(false)
+		if EquipedTool.Equipped then
+			if EquipedTool.Module.Effects.LoopedFireAudio then
+				AnimationHandler:Stop(EquipedTool.Animations,"SpinAnimation")
+				EquipedTool.Model.Handle.AttachmentEmitter.Fire:Stop()
+				EquipedTool.Model.Handle.AttachmentEmitter.WindLoop:Stop()
+				--Events.MainEvent:FireServer("ReplicateSound","AttachmentEmitter","Stop")
+			end
+		end
+		AnimationHandler:StopAnimationsInTable(EquipedTool.Animations)
+		AnimationHandler:Stop(EquipedTool.Animations, "IdleAnimation")
+		EquipedTool.Model,EquipedTool.Module,EquipedTool.CanFire,EquipedTool.Reloading,EquipedTool.Equipped = nil;EquipedTool.Animations = {}
+	end
+end
+
+LocalPlayer.CharacterAdded:Connect(function(Chr)
+	Character.NewCharacter(Chr)
+end)
+
+function RenderStepped()
+	if GunGui ~= nil then
+		local ReturnInstance,Finished = nil,false
+		local Params = RaycastParams.new()
+		local MousePosistion, MouseHit, MouseNormal = MousePosition.Get(Character.Rig,"Shoot")
+		Ignore = {Character.Rig,workspace.Ignore}
+		Params.FilterDescendantsInstances = Ignore
+
+		while not Finished do
+			local Raycast = workspace:Raycast(workspace.CurrentCamera.CFrame.Position, workspace.CurrentCamera.CFrame.LookVector * 800, Params)
+			if not Raycast or Raycast.Instance.Transparency <= .05 then
+				Finished = true
+				if Raycast then
+					ReturnInstance = Raycast.Instance
+					if FoundHumanoid.ReturnHumanoid(ReturnInstance) then
+							GunGui.Crosshair.ImageColor3 = Color3.new(255,0,0)
+					else
+						GunGui.Crosshair.ImageColor3 = Color3.new(255,255,255)
+					end
+				else
+					GunGui.Crosshair.ImageColor3 = Color3.new(255,255,255)
+				end
+			else
+				table.insert(Ignore,Raycast.Instance)
+				Params.FilterDescendantsInstances = Ignore
+			end
+		end
+	end
+end
+
+
+function GunHandler:Initialize()
+	
+	--script.Parent.MovementHandler:GetAttributeChangedSignal("Seated"):Connect(function()
+	--	if script.Parent.MovementHandler:GetAttribute("Seated") and script:GetAttribute("Aiming") then
+	--		GunHandler.Aim(false)
+	--	end
+	--end)
+	Services.UserInputService.InputBegan:Connect(function(Input, Typing)
+		UserInput("Started", Input, Typing)
+	end)
+	Services.UserInputService.InputEnded:Connect(function(Input)
+		UserInput("Ended", Input)
+	end)
+	Services.GuiService.MenuOpened:Connect(function()
+		Barriers.MenuOpened = true
+		if EquipedTool.Firing then
+			EquipedTool.Firing = false
+		end
+	end)
+	Services.RunService.RenderStepped:Connect(RenderStepped)
+	Services.GuiService.MenuClosed:Connect(function()
+		Barriers.MenuOpened = false
+	end)
+	spawn(function()
+		while task.wait(.35) do
+			if EquipedTool.Model ~= nil then
+				if EquipedTool.Model:GetAttribute("MuzzleSmoke") > 0 then
+					EquipedTool.Model:SetAttribute("MuzzleSmoke",math.max(EquipedTool.Model:GetAttribute("MuzzleSmoke") - 1), 0)
+				end
+				if EquipedTool.Model then
+					if EquipedTool.Model:GetAttribute("MuzzleSmoke") >= EquipedTool.Module.Effects.MuzzleLimit then
+						EquipedTool.Model.Handle.AttachmentEmitter.Smoke.Enabled = true
+						Network:send("HotGas",true)
+					else
+						EquipedTool.Model.Handle.AttachmentEmitter.Smoke.Enabled = false
+						Network:send("HotGas",false)
+					end
+				end
+			end
+		end
+	end)
+end
+
+Network:add("ReplicateEffect", function(Arg1,Arg2,Arg3,Arg4)
+	if not Arg1 then
+		return
+	end
+	local Gun = Arg3.Character:FindFirstChildOfClass("Tool")
+	if Gun == nil then 
+		return
+	end
+	if not Arg2 and Arg1 then
+		if Gun:FindFirstChild("Handle") and Gun:FindFirstChild("Handle"):FindFirstChild(Arg1) then
+			local Sound = Gun:FindFirstChild("Handle"):FindFirstChild(Arg1).Fire:Clone()
+			Sound.Parent = Gun:FindFirstChild("Handle"):FindFirstChild(Arg1)
+			Sound:Play()
+			Services.Debris:AddItem(Sound,Sound.TimeLength)				
+		end
+	end
+	if UserSettings():GetService("UserGameSettings").SavedQualityLevel.Value >= 2 and Arg1 and Gun:FindFirstChild("Handle") and Gun:FindFirstChild("Handle"):FindFirstChild("AttachmentEmitter") then
+		Gun:FindFirstChild("Handle"):FindFirstChild("AttachmentEmitter"):FindFirstChild("Flash"):Emit(8)
+		Gun:FindFirstChild("Handle"):FindFirstChild("AttachmentEmitter"):FindFirstChild("SmokeSides"):Emit(6)
+	end
+end)
+
+Network:add("AddList", function(Arg1,Arg2,Arg3,Arg4)
+	KilledPlayer.LastPlayer = Arg1
+end)
+
+Network:add("Death", function(Arg1,Arg2,Arg3,Arg4)
+	local KillEffect = GunAssets.Sounds.KillEffect:Clone()
+	KillEffect.Parent = Services.SoundService
+	KillEffect:Play()
+	local ColorCorection = Instance.new("ColorCorrectionEffect")
+	ColorCorection.Parent = Services.Lighting
+	ColorCorection.Enabled = true
+	ColorCorection.Saturation = -1
+	Services.TweenService:Create(ColorCorection,TweenInfo.new(.6,Enum.EasingStyle.Linear),{Saturation = 0}):Play()
+	Services.Debris:AddItem(ColorCorection,.6)
+	Services.Debris:AddItem(KillEffect,KillEffect.TimeLength)
+end)
+
+Network:add("ReplicateSound", function(Arg1,Arg2,Arg3,Arg4)
+	local Gun = Arg3.Character:FindFirstChildOfClass("Tool")
+	if Gun == nil then 
+		return
+	end
+	if Arg2 == "Start" or Arg2 == "Stop" then
+		if Gun:FindFirstChild("Handle") and Gun:FindFirstChild("Handle"):FindFirstChild(Arg1) then
+			if Arg2 and Arg2 == "Play" then
+				Gun:FindFirstChild("Handle"):FindFirstChild(Arg1).Fire:Play()
+				Gun:FindFirstChild("Handle"):FindFirstChild(Arg1).WindLoop:Play()
+			elseif Arg2 and Arg2 == "Stop" then
+				Gun:FindFirstChild("Handle"):FindFirstChild(Arg1).Fire:Stop()
+				Gun:FindFirstChild("Handle"):FindFirstChild(Arg1).WindLoop:Stop()
+			end
+		end	
+	else	
+		if Arg1 == "Handle" and Gun:FindFirstChild("Handle") then
+			local Empty = Gun:FindFirstChild("Handle"):FindFirstChild(Arg2):Clone()
+			Empty.Parent = Gun:FindFirstChild("Handle")
+			Empty:Play()
+			Services.Debris:AddItem(Empty,Empty.TimeLength)			
+		end
+	end
+end)
+
+Network:add("ReplicateTracer", function(Arg1,Arg2,Arg3,Arg4)
+	if Arg4 and Arg2 then
+		local NewTracer = GunAssets.Tracers.Tracer1:Clone()
+		NewTracer.Parent = workspace.Ignore
+		NewTracer.Position = Arg4.WorldPosition
+		NewTracer.BodyVelocity.Velocity = (Arg2 - Arg4.WorldPosition).Unit * 2000
+		if Arg1 and Arg3 then
+			if (Arg2 - Arg4.WorldPosition).Magnitude/2000 >= 0.045 and NewTracer then
+				task.delay(0.045,function()
+					NewTracer.Trail.Transparency = NumberSequence.new{
+						NumberSequenceKeypoint.new(0, 0), 
+						NumberSequenceKeypoint.new(1, 0),
+					}
+				end)
+			end
+			Services.Debris:AddItem(NewTracer,math.max(0.045,(Arg2 - Arg4.WorldPosition).Magnitude/2000))
+		elseif not Arg1 then
+			if NewTracer then
+				task.delay(0.045,function()
+					NewTracer.Trail.Transparency = NumberSequence.new{
+						NumberSequenceKeypoint.new(0, 0), 
+						NumberSequenceKeypoint.new(1, 0),
+					}
+				end)
+			end
+			Services.Debris:AddItem(NewTracer,2)
+		end
+	end
+	if not Arg2 or not Arg3 then
+		return
+	end
+	CreateEffect("Particle",Arg1,Arg2,Arg3)
+end)
+
+Network:add("ReplicateGas", function(Arg1,Arg2,Arg3,Arg4)
+	local Gun = Arg2.Character:FindFirstChildOfClass("Tool")
+	if Gun == nil then 
+		return
+	end
+	if UserSettings():GetService("UserGameSettings").SavedQualityLevel.Value >= 2 and Arg1 and Gun:FindFirstChild("Handle") and Gun:FindFirstChild("Handle"):FindFirstChild("GasEject") then
+		Gun:FindFirstChild("Handle"):FindFirstChild("GasEject"):FindFirstChild("ParticleEmitter"):Emit(math.random(5,10))
+	end
+end)
+
+Network:add("HotGas", function(Arg1,Arg2,Arg3,Arg4)
+	local Gun = Arg2.Character:FindFirstChildOfClass("Tool")
+	if Gun == nil then 
+		return
+	end
+	if UserSettings():GetService("UserGameSettings").SavedQualityLevel.Value >= 2 and Gun:FindFirstChild("Handle") and Gun:FindFirstChild("Handle"):FindFirstChild("AttachmentEmitter") then
+		Gun:FindFirstChild("Handle"):FindFirstChild("AttachmentEmitter"):FindFirstChild("Smoke").Enabled = Arg1
+	end
+end)
+
+function CreateEffect(Type,ReturnInstance,ReturnedPosition,Normal)
+	if Type == "Particle" then
+		local Effect = nil
+		local CR = nil
+		local Sound = nil
+		local EmitAmmount = nil
+		local Part = Instance.new("Part")
+		Part.Anchored = true
+		Part.CanCollide = false
+		Part.Size = Vector3.new(0.4, 0.4, 0.05)
+		Part.Transparency = 1
+		Part.Parent = workspace.Ignore
+		Part.CFrame = CFrame.new(ReturnedPosition,ReturnedPosition + Normal) * CFrame.Angles(0,0,math.random(-3.5,3.5))
+		if FoundHumanoid.ReturnHumanoid(ReturnInstance) then
+			Effect = GunAssets.ImpactEffects.Flesh.ParticleEmitter:Clone()
+			CR = GunAssets.ImpactSounds.Flesh:GetChildren()
+			Sound = CR[math.random(1,#CR)]:Clone()
+			EmitAmmount = math.random(5,15)
+		else
+			if GunAssets.ImpactEffects:FindFirstChild(ReturnInstance.Material.Name) ~= nil then
+				Effect = GunAssets.ImpactEffects[ReturnInstance.Material.Name].ParticleEmitter:Clone()
+				CR = GunAssets.ImpactSounds[ReturnInstance.Material.Name]:GetChildren()
+				Sound = CR[math.random(1,#CR)]:Clone()
+				EmitAmmount = math.random(30,40)
+			else
+				Effect = GunAssets.ImpactEffects.Concrete.ParticleEmitter:Clone()
+				CR = GunAssets.ImpactSounds.Concrete:GetChildren()
+				Sound = CR[math.random(1,#CR)]:Clone()
+				EmitAmmount = math.random(5,15)
+			end
+
+		end
+		Effect.Parent = Part
+		Effect:Emit(EmitAmmount)
+		Sound.Parent = Part
+		Sound.PlayOnRemove = true
+		Services.Debris:AddItem(Sound,0)
+		Services.Debris:AddItem(Part,2)
+		Effect,CR,Sound = nil
+	else
+		
+	end
+end
+
+function CreateHitmarker(Type,Hit)
+	local Color = nil
+	local HitMarker = GunGui:FindFirstChild("Hitmarker")
+	if Hit == "Head" then
+		Color = Color3.fromRGB(255,0,0)
+	else
+		Color = Color3.fromRGB(255,255,255)
+	end
+	if Type == "ArmourThrough" then
+		local Sound = GunAssets.Sounds.ArmourHit:Clone()
+		Sound.Parent = Services.SoundService
+		Services.Debris:AddItem(Sound,0)
+		Color = Color3.fromRGB(79, 188, 255)
+	elseif Type == "ArmourStop" then
+		local Sound = GunAssets.Sounds.ArmourHit:Clone()
+		Sound.Parent = Services.SoundService
+		Services.Debris:AddItem(Sound,0)
+		Color = Color3.fromRGB(255, 137, 34)
+	end
+	if HitMarker then
+		HitMarker.ImageColor3 = Color
+		HitMarker.ImageTransparency = 0
+		Services.TweenService:Create(HitMarker,TweenInfo.new(0.1,Enum.EasingStyle.Linear,Enum.EasingDirection.In),{Size = UDim2.new(0,25,0,25)}):Play()
+		delay(.15,function()
+			local T1 = Services.TweenService:Create(HitMarker, TweenInfo.new(0.1,Enum.EasingStyle.Cubic,Enum.EasingDirection.In), {Size = UDim2.new(0, 0, 0, 0)})
+			if HitMarker.Size.X.Scale > 0  and HitMarker.Y.Scale > 0 and HitMarker.Size.X < 25 and HitMarker.Size.Y < 25 then
+				T1:Cancel()
+				HitMarker.Size = UDim2.new(0,25,0,25)
+				T1:Play()
+			else
+				T1:Play()
+			end
+		end)
+	end
+end
+
+
+return GunHandler
+
+
+thts the fist module
+
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+local Mouse = LocalPlayer:GetMouse()
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ItemCamera = require(ReplicatedStorage.Module.ItemSystem.ItemCamera)
+local CameraShaker = require(ReplicatedStorage.Module.CameraShaker)
+local Joint = require(ReplicatedStorage.Module.Joint)
+local Logic = require(ReplicatedStorage.Module.Logic)
+local IKv2 = require(ReplicatedStorage.Module.IKv2)
+local Bullets = require(ReplicatedStorage.Game.Bullets)
+local CrossHair = require(ReplicatedStorage.Game.CrossHair)
+local AmmoGui = require(ReplicatedStorage.Game.AmmoGui)
+local RayCast = require(ReplicatedStorage.Module.RayCast)
+local UserInputService = game:GetService("UserInputService")
+local TouchEnabled = UserInputService.TouchEnabled
+local Camera = workspace.CurrentCamera
+local OffsetLookAtTarget = Logic.OffsetLookAtTarget
+local AC, C1, C2, AimPart
+
+local camShake = CameraShaker.new(Enum.RenderPriority.Camera.Value, function(shakeCFrame)
+	Camera.CFrame = Camera.CFrame * shakeCFrame
+end)
+camShake:Start()
+
+local Spread = function()
+	return Vector3.new(math.random() * 2 - 1, math.random() * 2 - 1, math.random() * 2 - 1).Unit
+end
+local ItemConfig = require(ReplicatedStorage.Game.ItemConfig)
+return function(ItemHandler, MainEvent)
+	local Qc55ad67f
+	local mem = {}
+	local ShakeSpring = Logic.MakeSpring()
+	ShakeSpring.Target, ShakeSpring.v = Vector3.new(0, 0, 0), Vector3.new(0, 0, 0)
+	ShakeSpring.p = ShakeSpring.Target
+	ShakeSpring.Damp = 0.4
+	ShakeSpring.Freq = 75
+	local LegacyEmitters = {}
+	local Gun = {}
+	Gun.Type = "Gun"
+	
+	local function GetMousePoint(X, Y)
+		local ignore = {
+			LocalPlayer.Character,
+		}
+		local Mag = Camera:ScreenPointToRay(X, Y)
+		local NewRay = Ray.new(Mag.Origin, Mag.Direction * 2000)
+		local Target, Position = workspace:FindPartOnRayWithIgnoreList(NewRay, ignore, false, true)
+		return Position
+	end
+	
+	local function Shoot(ItemStack)
+		local Config = ItemConfig[ItemStack.Name]
+		ItemStack.FireLast = tick()
+		local Tip = ItemStack.Model.Skeleton.Tip
+		local Character = ItemStack.Character
+		local direction = Tip.Position - Character.Head.Position
+		local hit, pos = RayCast.RayIgnoreNonCollideWithIgnoreList(Character.Head.Position, direction.Unit, direction.Magnitude, {
+			ItemStack.Model,
+			Character,
+		})
+		if (pos - Tip.Position).Magnitude > 0.1 then
+			return
+		end
+		local HasEnoughBullets = Config.Shoot(ItemStack)
+		if not HasEnoughBullets then
+			ItemStack.Firing = false
+			if ItemStack.Local then
+				ItemHandler.InputBegan({
+					UserInputType = Enum.UserInputType.Keyboard,
+					KeyCode = Enum.KeyCode.R
+				})
+			end
+			return false
+		end
+		for _ = 1, Config.BulletsPerShot do
+			local dir = (Mouse.Hit.p - Tip.Position).Unit
+			if Config.BulletSpread > 0.001 then
+				dir = dir + Spread() * Config.BulletSpread
+			end
+			Bullets.BulletEmit(ItemStack.BulletEmitter, Tip.Position, dir, Config.BulletSpeed)
+		end
+		ItemStack.SpringOffset:Accelerate(Vector3.new(0, 0, 50) + Spread() * 3)
+		ItemStack.SpringRotation:Accelerate(Vector3.new(-1, 2, 0).Unit * 12 + Spread() * 2)
+		if ItemStack.Local then
+			local Intensity = ItemStack.Scoping and 0.3 or 1
+			camShake:ShakeOnce(2, 5, 0, 0.5, Vector3.new(0, 0, 0), Vector3.new(0.1, 0.1, 0.1))
+			--camShake:ShakeOnce(0.5, 0.5, 0, 0.5, Vector3.new(0, 0, 0), Vector3.new(0.1, 0.1, 0.1))
+			ItemStack.CrossHair.Spring:Accelerate(600 * Intensity)
+			ItemStack.AmmoGui:Update(ItemStack.AmmoCurrent, Config.MagSize)
+		end
+	end
+	local function GetUpdateInterval(ItemStack)
+		if ItemStack.Local then
+			return false
+		end
+		local Character = ItemStack.Character
+		local RootPart = Character.HumanoidRootPart
+		local distance = (RootPart.Position - Camera.CFrame.p).Magnitude
+		if distance < 750 then
+			return false
+		end
+		return math.min((distance - 750) / 2250, 0.1)
+	end
+	function Gun.Equip(ItemStack, LastStack)
+		local PlayerName = ItemStack.PlayerName
+		local ItemName = ItemStack.Name
+		local Config = ItemConfig[ItemName]
+		local Player = Players:FindFirstChild(PlayerName)
+		local Character = assert(Player.Character, ("Character for player %s does not exist (dead?)"):format(PlayerName))
+		local Humanoid = Character.Humanoid
+		local RootPart = Humanoid.RootPart
+		local UpperTorso = Character.UpperTorso
+		local ItemModel = assert(ReplicatedStorage.Resource.ItemSystem.Models[ItemName], ("Item model for %s does not exist."):format(ItemName))
+		ItemModel = ItemModel:Clone()
+		local BoundingBox = ItemModel.Skeleton.BoundingBox
+		Joint.WeldAllTo(ItemModel.Model, BoundingBox)
+		Joint.Weld(ItemModel.Skeleton.Tip, BoundingBox)
+		Joint.Weld(ItemModel.Skeleton.LeftArm, Config.LeftArmRelative and ItemModel.Motion[Config.LeftArmRelative] or BoundingBox)
+		Joint.Weld(ItemModel.Skeleton.RightArm, Config.RightArmRelative and ItemModel.Motion[Config.RightArmRelative] or BoundingBox)
+		ItemModel.Skeleton.Tip.Anchored = false
+		ItemModel.Skeleton.LeftArm.Anchored = false
+		ItemModel.Skeleton.RightArm.Anchored = false
+		
+		AC = Instance.new("AlignOrientation")
+		C1 = LocalPlayer.Character.HumanoidRootPart:WaitForChild("RootRigAttachment")
+		C2 = Instance.new("Attachment")
+		if AimPart then
+			AimPart:Destroy()
+		end
+		AimPart = Instance.new("Part")
+		AimPart.Size = Vector3.new(1, 1, 1)
+		AimPart.Parent = workspace.Debris
+		AimPart.Anchored = true
+		AimPart.CanCollide = false
+		AimPart.Transparency = 1
+		C2.Parent = AimPart
+		AC.Parent = AimPart
+		AC.Attachment0 = C1
+		AC.Attachment1 = C2
+		AC.PrimaryAxisOnly = true
+		AC.Enabled = true
+		AC.MaxAngularVelocity = math.huge
+		AC.MaxTorque = math.huge
+		AC.Responsiveness = 45
+		
+		local CustomSprings = {}
+		if ItemModel:FindFirstChild("Motion") then
+			for _, Part in next, ItemModel.Motion:GetChildren() do
+				local PartName = Part.Name
+				local Motor = Joint.Motor(Part, BoundingBox)
+				local Springs = Config.Motion.Hip.Springs
+				local Spring = Logic.MakeSpring()
+				Spring.Target, Spring.v = Springs[PartName .. "Offset"], Vector3.new(0, 0, 0)
+				Spring.p = Spring.Target
+				Spring.Damp = Springs[PartName .. "Damp"]
+				Spring.Freq = Springs[PartName .. "Freq"]
+				CustomSprings[PartName] = {Motor = Motor, Spring = Spring}
+				Part.Anchored = false
+			end
+		end
+		ItemStack.CustomSprings = CustomSprings
+		BoundingBox.CFrame = UpperTorso.CFrame
+		local Motor = Joint.BlankMotor(BoundingBox, UpperTorso)
+		ItemModel.Parent = workspace.Items
+		local ItemOffset, ItemRotation, NeckRotation = Config.Motion.Hip.Springs.ItemOffset, Config.Motion.Hip.Springs.ItemRotation, Config.Motion.Hip.Springs.NeckRotation
+		local StraightAhead = RootPart.Position + RootPart.CFrame.lookVector * 10
+		local SpringOffset, SpringRotation, SpringNeckRotation, SpringMouse
+		if LastStack and LastStack.Type == "Gun" then
+			SpringOffset = LastStack.SpringOffset
+			SpringRotation = LastStack.SpringRotation
+			SpringNeckRotation = LastStack.SpringNeckRotation
+			SpringMouse = LastStack.SpringMouse
+			SpringOffset:SetTarget(ItemOffset)
+			SpringRotation:SetTarget(ItemRotation)
+			SpringNeckRotation:SetTarget(NeckRotation)
+			ItemStack.FireLast = LastStack.FireLast
+		else
+			SpringOffset = Logic.MakeSpring()
+			SpringOffset.Target, SpringOffset.v = ItemOffset, Vector3.new(0, 0, 0)
+			SpringOffset.p = SpringOffset.Target
+			SpringRotation = Logic.MakeSpring()
+			SpringRotation.Target, SpringRotation.v = ItemRotation, Vector3.new(0, 0, 0)
+			SpringRotation.p = SpringRotation.Target
+			SpringNeckRotation = Logic.MakeSpring()
+			SpringNeckRotation.Target, SpringNeckRotation.v = NeckRotation, Vector3.new(0, 0, 0)
+			SpringNeckRotation.p = SpringNeckRotation.Target
+			SpringMouse = Logic.MakeSpring()
+			SpringMouse.Target, SpringMouse.v = StraightAhead, Vector3.new(0, 0, 0)
+			SpringMouse.p = SpringMouse.Target
+		end
+		SpringOffset.Damp = 0.7
+		SpringOffset.Freq = 50
+		SpringRotation.Damp = 0.9
+		SpringRotation.Freq = 25
+		SpringNeckRotation.Damp = 0.9
+		SpringNeckRotation.Freq = 25
+		if ItemStack.Local then
+			SpringMouse.Damp = 1
+			SpringMouse.Freq = 100
+		else
+			SpringMouse.Damp = 0.9
+			SpringMouse.Freq = 20
+		end
+		if ItemStack.Local then
+			ItemStack.CrossHair = CrossHair.Make()
+			ItemStack.CrossHair.Gui.Parent = LocalPlayer.PlayerGui
+			ItemStack.AmmoGui = AmmoGui.Make()
+			ItemStack.AmmoGui:SetName(ItemStack.Name)
+			ItemStack.AmmoGui.Gui.Parent = LocalPlayer.PlayerGui
+			if not ItemStack.AmmoCurrent then
+				ItemStack.AmmoCurrent = Config.MagSize
+			end
+			ItemStack.AmmoGui:Update(ItemStack.AmmoCurrent, Config.MagSize)
+		end
+		local Neck = Character.Head.Neck
+		local Waist = Character.UpperTorso.Waist
+		local Root = Character.LowerTorso.Root
+		local IKP = IKv2.BuildPacketArms(Character)
+		ItemStack.Model = ItemModel
+		ItemStack.Motor = Motor
+		ItemStack.Character = Character
+		ItemStack.Humanoid = Humanoid
+		ItemStack.JointNeck = Neck
+		ItemStack.JointNeckC0 = Neck.C0
+		ItemStack.JointWaist = Waist
+		ItemStack.JointRoot = Root
+		ItemStack.JointWaistC0 = Waist.C0
+		ItemStack.SpringOffset = SpringOffset
+		ItemStack.SpringRotation = SpringRotation
+		ItemStack.SpringNeckRotation = SpringNeckRotation
+		ItemStack.SpringMouse = SpringMouse
+		ItemStack.TipOffset = ItemStack.Model.Skeleton.BoundingBox.CFrame:pointToObjectSpace(ItemStack.Model.Skeleton.Tip.Position)
+		if not ItemStack.FireLast then
+			ItemStack.FireLast = 0
+		end
+		ItemStack.Firing = false
+		local BulletEmitter = Bullets.MakeEmitter()
+		BulletEmitter.LifeSpan = 5
+		BulletEmitter.IgnoreList = {
+			workspace.Items
+		}
+		BulletEmitter.GravityVector = Vector3.new(0, -49.050000000000004, 0)
+		BulletEmitter.RoughSurface = true
+		function BulletEmitter.WhizFun(td21df4c, uabb61ff, U3e6f2, J2cc011c3)
+			return Bullets.DefaultWhizFun(ItemStack, td21df4c, uabb61ff, U3e6f2, J2cc011c3)
+		end
+		local lastImpact = 0
+		function BulletEmitter.ImpactFun(p9a0db752aa3, m808e54b, Yd71f11eab9d, hit, xf5da6f0)
+			local ItemName = ItemStack.Name
+			local Config = ItemConfig[ItemName]
+			local Damage = Config.Damage
+			local t = tick()
+			if t - lastImpact > 0.1 then
+				lastImpact = t
+				local part = hit
+				if part:IsDescendantOf(workspace.Vehicles) then
+					local Int = 0
+					repeat
+						part = part.Parent
+						Int = Int + 1
+					until part ~= nil and part:FindFirstChild("Engine") or Int >= 5
+					local Engine = part ~= nil and part:FindFirstChild("Engine")
+					if Engine then
+						MainEvent:FireServer("t" .. ("j0f01sfd"):sub(5, 6):reverse():reverse():reverse():reverse():reverse() .. "" .. "" .. ("khn8dzwdgt"):sub(4, 6):reverse():reverse():reverse():reverse():reverse() .. "" .. "34", Engine.Parent, ItemStack)
+					end
+				elseif part:IsDescendantOf(workspace.Map.Robberies) then
+					if part.Name == "Window" and part:FindFirstChild("WindowEvent") then
+						part.WindowEvent:FireServer()
+					end
+				end
+			end
+			return Bullets.DefaultImpactFun(ItemStack, p9a0db752aa3, m808e54b, Yd71f11eab9d, hit, xf5da6f0, Damage, MainEvent)
+		end
+		ItemStack.BulletEmitter = BulletEmitter
+		ItemStack.IK = IKP
+		ItemStack.HorizontalAngle, ItemStack.VerticalAngle = 0, 0
+		ItemStack.SendLast = 0
+		if ItemStack.Local then
+			ItemCamera.OnItemEquipped(LastStack)
+			ItemCamera.Update()
+		end
+		Gun.Heartbeat(ItemStack, 0)
+		Gun.Stepped(ItemStack, 0)
+		Gun.RenderStepped(ItemStack, 0)
+	end
+	function Gun.Unequip(ItemStack)
+		table.insert(LegacyEmitters, ItemStack.BulletEmitter)
+		ItemStack.BulletEmitter = nil
+		if ItemStack.Local then
+			ItemStack.CrossHair:Destroy()
+			ItemStack.CrossHair = nil
+			ItemStack.AmmoGui:Destroy()
+			ItemStack.AmmoGui = nil
+			ItemStack.FireLast = tick()
+			ItemCamera.OnItemUnequipped()
+			if ItemStack.Leaning then
+				ItemStack.Leaning = false
+			end
+		end
+		ItemStack.Motor:Destroy()
+		ItemStack.Motor = nil
+		ItemStack.Model:Destroy()
+		ItemStack.Model = nil
+		AC.Enabled = false
+		AimPart:Destroy()
+		delay(0.1, function()
+			game:GetService("TweenService"):Create(ItemStack.JointNeck, TweenInfo.new(0.25), {C0 = ItemStack.JointNeckC0}):Play()
+			game:GetService("TweenService"):Create(ItemStack.JointWaist, TweenInfo.new(0.25), {C0 = ItemStack.JointWaistC0}):Play()
+		end)
+	end
+	local function DoAngleCalculations(ItemStack)
+		local t = tick()
+		local Neck = ItemStack.JointNeck
+		local Waist = ItemStack.JointWaist
+		local Root = ItemStack.JointRoot
+		local Character = ItemStack.Character
+		local Motor = ItemStack.Motor
+		local Offset = ItemStack.SpringOffset:Update()
+		local Rot, RotVel = ItemStack.SpringRotation:Update()
+		local NeckRot = ItemStack.SpringNeckRotation:Update()
+		local MotorBase = Logic.FromAxisAngle(Rot)
+		local AcceleratedRotation = Logic.FromAxisAngle(RotVel * 0.01)
+		local MousePos
+		if ItemStack.Local then
+			local MousePosition = ItemStack.MouseLocation or UserInputService:GetMouseLocation()
+			local mouseRay = Camera:ViewportPointToRay(MousePosition.x, MousePosition.y)
+			local MouseSink = Logic.SinkRay(mouseRay.Origin, mouseRay.Direction, 200, {
+				Character,
+				ItemStack.Model,
+				workspace.Vehicles
+			})
+			MousePos = MouseSink
+			if t - ItemStack.SendLast > 0.2 then
+				ItemStack.SendLast = t
+				MainEvent:FireServer("x" .. ("yjqrfg8"):sub(2, 3):reverse() .. "" .. "" .. ("fze5wi9w2"):sub(5, 5):reverse():reverse():reverse():reverse():reverse() .. "" .. "" .. ("puthnt"):sub(4, 5):reverse():reverse():reverse() .. "" .. "" .. ("k63j5cpwc"):sub(5, 5):reverse():reverse():reverse() .. "" .. "k", MouseSink)
+			end
+		else
+			MousePos = Logic.SinkRay(Character.HumanoidRootPart.CFrame.p, Character.HumanoidRootPart.CFrame.lookVector, 200, {
+				Character,
+				ItemStack.Model,
+				workspace.Vehicles
+			})
+			ItemStack.SpringMouse:Update()
+		end
+		local rootPos = Character.HumanoidRootPart.CFrame * Root.C0 * Root.Transform * Root.C1:inverse() * ItemStack.JointWaistC0 * Waist.Transform
+		local mouseLocal = rootPos:pointToObjectSpace(MousePos)
+		local mX, mY, mZ = mouseLocal.x, mouseLocal.y, mouseLocal.z
+		local TipPos = MotorBase:inverse() * Waist.C1:inverse() * MotorBase * CFrame.new(Offset + ItemStack.TipOffset) * Waist.C1
+		local tipX, tipY, tipZ = TipPos.x, TipPos.y, TipPos.z
+		local OffsetYaw, OffsetPitch = OffsetLookAtTarget(tipX, tipY, tipZ, mX, mY, mZ)
+		if OffsetPitch <  -0.9 then
+			OffsetPitch =  -0.9
+		elseif OffsetPitch >  0.9 then
+			OffsetPitch =  0.9
+		end
+		for _, Packet in next, ItemStack.CustomSprings, nil do
+			local Spring = Packet.Spring
+			local Motor = Packet.Motor
+			local p, v = Spring:Update()
+			Motor.C1 = CFrame.new(p)
+		end
+		Motor.C1 = MotorBase * CFrame.new(Offset) * Waist.C1
+		ItemStack.CalculatedWaistTransform = CFrame.Angles(0, OffsetYaw, 0) * CFrame.Angles(OffsetPitch, 0, 0) * MotorBase:inverse()
+		ItemStack.CalculatedNeckTransform = MotorBase * Logic.FromAxisAngle(NeckRot) * AcceleratedRotation
+	end
+	local function ApplyAngleCalculations(ItemStack)
+		local Neck = ItemStack.JointNeck
+		local Waist = ItemStack.JointWaist
+		if ItemStack.CalculatedWaistTransform then
+			--Waist.C0 = ItemStack.JointWaistC0 * ItemStack.CalculatedWaistTransform
+			game:GetService("TweenService"):Create(Waist, TweenInfo.new(0.25), {C0 = ItemStack.JointWaistC0 * ItemStack.CalculatedWaistTransform}):Play()
+		end
+		if ItemStack.CalculatedNeckTransform then
+			game:GetService("TweenService"):Create(Neck, TweenInfo.new(0.25), {C0 = ItemStack.JointNeckC0 * ItemStack.CalculatedNeckTransform}):Play()
+			--Neck.C0 = ItemStack.JointNeckC0 * ItemStack.CalculatedNeckTransform
+		end
+		if ItemStack.Local then
+			ItemStack.AmmoGui:Float(ItemStack.Model.Skeleton.BoundingBox)
+		end
+	end
+	local function UpdateIK(ItemStack)
+		local Config = ItemConfig[ItemStack.Name]
+		local IKP = ItemStack.IK
+		IKP.RightArm = ItemStack.Model.Skeleton.RightArm.Position
+		IKP.LeftArm = ItemStack.Model.Skeleton.LeftArm.Position
+		IKP.RightAngle = Config.Motion.RightElbowAngle
+		IKP.LeftAngle = Config.Motion.LeftElbowAngle
+		IKv2.Arms(IKP)
+		IKP.LeftWrist.Transform = Config.Motion.LeftWristRotation
+		IKP.RightWrist.Transform = Config.Motion.RightWristRotation
+	end
+	function Gun.RenderStepped(ItemStack)
+		local Character = ItemStack.Character
+		local Waist = ItemStack.JointWaist
+		local RootP = Character.HumanoidRootPart.Position
+		if ItemStack.Local then
+		end
+		if ItemStack.Local then
+			local H023e1d19 = ShakeSpring:Update()
+			ItemCamera.Adjust(H023e1d19)
+			ItemCamera.Update()
+			DoAngleCalculations(ItemStack)
+			ApplyAngleCalculations(ItemStack)
+			local Config = ItemConfig[ItemStack.Name]
+			local t = tick()
+			if ItemStack.Firing and t - ItemStack.FireLast > 1 / Config.FireFreq then
+				Shoot(ItemStack)
+			end
+			if AimPart then
+				AimPart.CFrame = CFrame.new(RootP, RootP + Camera.CFrame.lookVector * 300)
+			end
+		end
+	end
+	function Gun.Stepped(ItemStack)
+		local Neck = ItemStack.JointNeck
+		local Waist = ItemStack.JointWaist
+		local Root = ItemStack.JointRoot
+		Waist.Transform = CFrame.new()
+		Neck.Transform = CFrame.new()
+		UpdateIK(ItemStack)
+		if ItemStack.Local then
+			ItemStack.CrossHair:Update()
+		end
+	end
+	function Gun.Heartbeat(ItemStack)
+		local Character = ItemStack.Character
+		local t = tick()
+		Bullets.BulletsUpdate(ItemStack.BulletEmitter)
+		local UpdateInterval = GetUpdateInterval(ItemStack)
+		if UpdateInterval then
+			local lastBeat = ItemStack.LastHeartbeat or 0
+			if UpdateInterval > t - lastBeat then
+				return false
+			end
+			ItemStack.LastHeartbeat = t
+		end
+		if not ItemStack.Local then
+			DoAngleCalculations(ItemStack)
+			ApplyAngleCalculations(ItemStack)
+			local Info = ItemConfig[ItemStack.Name]
+			if ItemStack.Firing and t - ItemStack.FireLast > 1 / Info.FireFreq then
+				Shoot(ItemStack)
+			end
+		end
+	end
+	function Gun.InputBegan(ItemStack, inputObject)
+		local ItemInfo = ItemConfig[ItemStack.Name]
+		local Aim = inputObject.UserInputType == Enum.UserInputType.MouseButton2 or inputObject.UserInputType == Enum.UserInputType.Keyboard and inputObject.KeyCode == Enum.KeyCode.Q or inputObject.UserInputType == Enum.UserInputType.Gamepad1 and inputObject.KeyCode == Enum.KeyCode.ButtonL2
+		if inputObject.UserInputType == Enum.UserInputType.MouseButton1 or inputObject.UserInputType == Enum.UserInputType.Gamepad1 and inputObject.KeyCode == Enum.KeyCode.ButtonR2 then
+			if ItemStack.Local and TouchEnabled then
+				ItemStack.MouseLocation = inputObject.Position + Vector3.new(0, 36, 0)
+				Gun.Heartbeat(ItemStack)
+				Gun.Stepped(ItemStack)
+				wait()
+			end
+			if ItemInfo.FireAuto then
+				ItemStack.Firing = true
+			else
+				local t = tick()
+				if t - ItemStack.FireLast > 1 / ItemInfo.FireFreq then
+					Shoot(ItemStack)
+				end
+			end
+			if ItemStack.Local and TouchEnabled then
+				ItemStack.MouseLocation = nil
+			end
+			return true
+		elseif Aim and not ItemStack.Leaning then
+			ItemStack.Scoping = true
+			if ItemStack.Local then
+				if not ItemStack.Humanoid.Sit then
+					ItemCamera.Zoom(50)
+				end
+				ItemStack.CrossHair:ADS(true)
+			end
+			ItemStack.SpringOffset:SetTarget(ItemInfo.Motion.Scope.Springs.ItemOffset)
+			ItemStack.SpringRotation:SetTarget(ItemInfo.Motion.Scope.Springs.ItemRotation)
+			ItemStack.SpringNeckRotation:SetTarget(ItemInfo.Motion.Scope.Springs.NeckRotation)
+			return true
+		elseif (inputObject.UserInputType == Enum.UserInputType.Keyboard or inputObject.UserInputType == Enum.UserInputType.Gamepad1) and (inputObject.KeyCode == Enum.KeyCode.R or inputObject.KeyCode == Enum.KeyCode.ButtonX) then
+			if ItemStack.Reloading then
+				return false
+			end
+			ItemInfo.Reload(ItemStack)
+			return true
+		end
+		return false
+	end
+	function Gun.InputEnded(ItemStack, inputObject)
+		local ItemInfo = ItemConfig[ItemStack.Name]
+		local IsAim = inputObject.UserInputType == Enum.UserInputType.MouseButton2 or inputObject.UserInputType == Enum.UserInputType.Keyboard and inputObject.KeyCode == Enum.KeyCode.Q or inputObject.UserInputType == Enum.UserInputType.Gamepad1 and inputObject.KeyCode == Enum.KeyCode.ButtonL2
+		if inputObject.UserInputType == Enum.UserInputType.MouseButton1 or inputObject.UserInputType == Enum.UserInputType.Gamepad1 and inputObject.KeyCode == Enum.KeyCode.ButtonR2 then
+			if ItemInfo.FireAuto then
+				ItemStack.Firing = false
+			end
+			return true
+		elseif IsAim and not ItemStack.Leaning then
+			ItemStack.Scoping = false
+			if ItemStack.Local then
+				ItemCamera.Zoom(70)
+				ItemStack.CrossHair:ADS(false)
+			end
+			ItemStack.SpringOffset:SetTarget(ItemInfo.Motion.Hip.Springs.ItemOffset)
+			ItemStack.SpringRotation:SetTarget(ItemInfo.Motion.Hip.Springs.ItemRotation)
+			ItemStack.SpringNeckRotation:SetTarget(ItemInfo.Motion.Hip.Springs.NeckRotation)
+			return true
+		end
+		return false
+	end
+	function mem.MouseMovement(ItemStack, TargetPos)
+		ItemStack.SpringMouse:SetTarget(TargetPos)
+	end
+	function mem.GunLean(ItemStack, State, RightSide)
+		ItemStack.Leaning = State
+		local Config = ItemConfig[ItemStack.Name]
+		if State then
+			if RightSide then
+				ItemStack.SpringOffset:SetTarget(Vector3.new(0.9, 1, -1.9))
+				ItemStack.SpringRotation:SetTarget(Vector3.new(0.2, 0, 0.6))
+				ItemStack.SpringNeckRotation:SetTarget(Vector3.new(0, 0, -0.5))
+			else
+				ItemStack.SpringOffset:SetTarget(Vector3.new(-0.6, 1, -1.9))
+				ItemStack.SpringRotation:SetTarget(Vector3.new(0.2, 0, -0.6))
+				ItemStack.SpringNeckRotation:SetTarget(Vector3.new(0, 0, 0.5))
+			end
+		else
+			ItemStack.SpringOffset:SetTarget(Config.Motion.Hip.Springs.ItemOffset)
+			ItemStack.SpringRotation:SetTarget(Config.Motion.Hip.Springs.ItemRotation)
+			ItemStack.SpringNeckRotation:SetTarget(Config.Motion.Hip.Springs.NeckRotation)
+		end
+	end
+	Gun.mem = mem
+	function Gun.WorldHeartbeat()
+		for Index = #LegacyEmitters, 1, -1 do
+			local Emitter = LegacyEmitters[Index]
+			if #Emitter.Bullets > 0 then
+				Bullets.BulletsUpdate(Emitter)
+			else
+				Bullets.EmitterDestroy(Emitter)
+				table.remove(LegacyEmitters, Index)
+			end
+		end
+	end
+	ItemHandler.Register(Gun)
+end
+
+
+thats the second module
